@@ -843,10 +843,14 @@ async function startHttp() {
     );
   }
 
-  const app = createMcpExpressApp({ host });
-
   const publicUrl = process.env.MCP_PUBLIC_URL || `http://${host === "0.0.0.0" ? "localhost" : host}:${port}`;
   const resourceServerUrl = new URL("/mcp", publicUrl);
+
+  // Allow the loopback aliases plus whatever hostname MCP_PUBLIC_URL points at, so a reverse
+  // proxy or tunnel (which sends its own Host header, not "localhost") isn't rejected by the
+  // DNS-rebinding-protection middleware below.
+  const allowedHosts = Array.from(new Set(["127.0.0.1", "localhost", "[::1]", host, resourceServerUrl.hostname]));
+  const app = createMcpExpressApp({ host, allowedHosts });
 
   let oauthBearer: ((req: Request, res: Response, next: NextFunction) => void) | undefined;
   try {
