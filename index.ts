@@ -7,8 +7,9 @@ import { z } from "zod";
 import { execSync, spawn, type ChildProcess } from "child_process";
 import { platform } from "os";
 import { randomUUID, timingSafeEqual } from "crypto";
-import { existsSync } from "fs";
-import { resolve } from "path";
+import { existsSync, readFileSync, statSync } from "fs";
+import { resolve, extname } from "path";
+import { pathToFileURL } from "url";
 import { config as loadDotenv } from "dotenv";
 import type { Request, Response, NextFunction } from "express";
 import { installOAuthShim } from "./oauth.js";
@@ -50,6 +51,38 @@ function resolveWorkingDir(workingDir?: string): string {
     currentWorkingDirectory = workingDir;
   }
   return currentWorkingDirectory;
+}
+
+// File download support - reads a file and returns it as an MCP embedded resource, so it can
+// be downloaded/saved by the client. Capped in size since the whole file has to fit in the
+// tool response (base64-encoded for binaries, ~33% larger than the file itself).
+const MAX_DOWNLOAD_BYTES = process.env.MCP_MAX_DOWNLOAD_BYTES
+  ? parseInt(process.env.MCP_MAX_DOWNLOAD_BYTES, 10)
+  : 10 * 1024 * 1024; // 10 MB
+
+const MIME_TYPES: Record<string, string> = {
+  ".txt": "text/plain", ".md": "text/markdown", ".json": "application/json",
+  ".xml": "application/xml", ".html": "text/html", ".htm": "text/html",
+  ".css": "text/css", ".js": "text/javascript", ".ts": "text/plain",
+  ".csv": "text/csv", ".yaml": "text/yaml", ".yml": "text/yaml", ".log": "text/plain",
+  ".pdf": "application/pdf", ".zip": "application/zip", ".7z": "application/x-7z-compressed",
+  ".rar": "application/vnd.rar", ".gz": "application/gzip",
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+  ".svg": "image/svg+xml", ".webp": "image/webp", ".bmp": "image/bmp", ".ico": "image/x-icon",
+  ".mp3": "audio/mpeg", ".wav": "audio/wav", ".mp4": "video/mp4", ".mov": "video/quicktime",
+  ".exe": "application/x-msdownload", ".dll": "application/x-msdownload", ".msi": "application/x-msi",
+  ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+};
+
+function guessMimeType(filePath: string): string {
+  return MIME_TYPES[extname(filePath).toLowerCase()] ?? "application/octet-stream";
+}
+
+function looksLikeText(buffer: Buffer): boolean {
+  return !buffer.subarray(0, 8000).includes(0);
 }
 
 // Background process tracking, so long-running commands can be started without
@@ -723,6 +756,66 @@ server.tool(
   }
 );
 
+// Register the download_file tool
+server.tool(
+  "download_file",
+  "Read a file from this computer and return its contents so it can be downloaded/saved by the MCP client. " +
+  `Text files are returned as plain text by default; binary files are base64-encoded. Files larger than ${MAX_DOWNLOAD_BYTES} bytes are rejected (set MCP_MAX_DOWNLOAD_BYTES to change this).`,
+  {
+    path: z.string().describe("Path to the file to download. Relative paths are resolved against the current persisted working directory (see execute_command's workingDir)."),
+    encoding: z.enum(["auto", "text", "base64"]).default("auto").describe("'auto' picks text for text-like files and base64 for everything else; 'text' forces UTF-8 text; 'base64' forces base64 encoding."),
+  },
+  async ({ path: filePath, encoding }) => {
+    try {
+      const resolvedPath = resolve(currentWorkingDirectory, filePath);
+      if (!existsSync(resolvedPath)) {
+        return { isError: true, content: [{ type: "text", text: `File not found: ${resolvedPath}` }] };
+      }
+      const stats = statSync(resolvedPath);
+      if (!stats.isFile()) {
+        return { isError: true, content: [{ type: "text", text: `Not a regular file: ${resolvedPath}` }] };
+      }
+      if (stats.size > MAX_DOWNLOAD_BYTES) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `File is too large to download (${stats.size} bytes, limit is ${MAX_DOWNLOAD_BYTES} bytes). ` +
+                    `Set MCP_MAX_DOWNLOAD_BYTES to raise the limit.`,
+            },
+          ],
+        };
+      }
+
+      const buffer = readFileSync(resolvedPath);
+      const mimeType = guessMimeType(resolvedPath);
+      const asText =
+        encoding === "text" ||
+        (encoding === "auto" &&
+          (mimeType.startsWith("text/") || mimeType === "application/json" || mimeType === "application/xml" || looksLikeText(buffer)));
+      const uri = pathToFileURL(resolvedPath).href;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Downloaded ${resolvedPath} (${stats.size} bytes, ${mimeType}, ${asText ? "text" : "base64"}).`,
+          },
+          {
+            type: "resource",
+            resource: asText
+              ? { uri, mimeType, text: buffer.toString("utf-8") }
+              : { uri, mimeType, blob: buffer.toString("base64") },
+          },
+        ],
+      };
+    } catch (error) {
+      return { isError: true, content: [{ type: "text", text: `Error downloading file: ${error}` }] };
+    }
+  }
+);
+
 // Register background-process management tools (mirrors run_in_background + monitor/stop tooling
 // found in interactive shell tools).
 server.tool(
@@ -851,6 +944,14 @@ async function startHttp() {
   // DNS-rebinding-protection middleware below.
   const allowedHosts = Array.from(new Set(["127.0.0.1", "localhost", "[::1]", host, resourceServerUrl.hostname]));
   const app = createMcpExpressApp({ host, allowedHosts });
+
+  // When MCP_PUBLIC_URL points somewhere other than this process's own bind address, we're
+  // behind a reverse proxy or tunnel. Tell Express to trust its X-Forwarded-* headers (one hop)
+  // so req.ip/req.protocol are correct and express-rate-limit doesn't reject them.
+  if (resourceServerUrl.hostname !== host) {
+    const trustProxyHops = process.env.MCP_TRUST_PROXY ? parseInt(process.env.MCP_TRUST_PROXY, 10) : 1;
+    app.set("trust proxy", trustProxyHops);
+  }
 
   let oauthBearer: ((req: Request, res: Response, next: NextFunction) => void) | undefined;
   try {

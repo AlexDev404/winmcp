@@ -72,12 +72,15 @@ Create new projects safely with the built-in project creation tool:
 3. **get_background_output**: Fetch stdout/stderr and status for a command started with `runInBackground`
 4. **list_background_processes**: List all background processes and their status
 5. **stop_background_process**: Terminate a running background process
-6. **list_running_processes**: Retrieve active system processes
-7. **get_system_info**: Collect system configuration details
-8. **get_network_info**: Retrieve network adapter information
-9. **get_scheduled_tasks**: List and query system tasks
-10. **get_service_info**: Manage and query Windows services
-11. **list_allowed_commands**: List all commands that can be executed by the server
+6. **download_file**: Read a file from this computer and return it (text or base64) so it can be downloaded/saved by the MCP client
+7. **list_running_processes**: Retrieve active system processes
+8. **get_system_info**: Collect system configuration details
+9. **get_network_info**: Retrieve network adapter information
+10. **get_scheduled_tasks**: List and query system tasks
+11. **get_service_info**: Manage and query Windows services
+12. **list_allowed_commands**: List all commands that can be executed by the server
+
+`download_file` is capped at 10 MB by default (base64 encoding inflates binary files by ~33% in the response) - set `MCP_MAX_DOWNLOAD_BYTES` to a different byte count to change the limit.
 
 ## Using with Claude for Desktop
 

@@ -52,7 +52,14 @@ class SharedSecretOAuthProvider extends DemoInMemoryAuthProvider {
 
   checkSecret(provided: string | undefined): boolean {
     if (!this.authToken) return true;
-    return !!provided && constantTimeEquals(provided, this.authToken);
+    const ok = !!provided && constantTimeEquals(provided, this.authToken);
+    if (!ok) {
+      // Lengths only - never log the token values themselves.
+      console.error(
+        `OAuth /authorize: token mismatch (submitted value was ${provided ? provided.length : 0} chars; expected ${this.authToken.length} chars)`
+      );
+    }
+    return ok;
   }
 }
 
@@ -70,7 +77,7 @@ function renderLoginForm(client: OAuthClientInformationFull, params: Authorizati
 <body>
   <h1>${clientName} wants to connect</h1>
   <p>Enter the server's access token to authorize this connection.</p>
-  <form method="POST" action="/authorize">
+  <form method="POST" action="/authorize" autocomplete="off">
     <input type="hidden" name="client_id" value="${escapeHtml(client.client_id)}">
     <input type="hidden" name="redirect_uri" value="${escapeHtml(params.redirectUri)}">
     <input type="hidden" name="response_type" value="code">
@@ -79,7 +86,8 @@ function renderLoginForm(client: OAuthClientInformationFull, params: Authorizati
     <input type="hidden" name="scope" value="${escapeHtml((params.scopes ?? []).join(" "))}">
     <input type="hidden" name="state" value="${escapeHtml(params.state ?? "")}">
     <input type="hidden" name="resource" value="${escapeHtml(params.resource?.toString() ?? "")}">
-    <input type="password" name="token" placeholder="Access token" autofocus required>
+    <input type="password" name="token" placeholder="Access token" autofocus required
+           autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
     ${error ? `<div class="error">${escapeHtml(error)}</div>` : ""}
     <button type="submit">Authorize</button>
   </form>
