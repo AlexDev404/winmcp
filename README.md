@@ -122,11 +122,27 @@ Environment variables:
 | `MCP_TRANSPORT` | `stdio` | Set to `http` to run the Streamable HTTP server instead of stdio. |
 | `MCP_HOST` | `127.0.0.1` | Interface to bind. Binding beyond localhost is only safe with `MCP_AUTH_TOKEN` set. |
 | `MCP_PORT` | `3000` | Port to listen on. |
-| `MCP_AUTH_TOKEN` | *(none)* | If set, all `/mcp` requests must include `Authorization: Bearer <token>`. |
+| `MCP_AUTH_TOKEN` | *(none)* | Shared secret. If set, all `/mcp` requests must present it, either as `Authorization: Bearer <token>` directly, or via the OAuth flow below. |
+| `MCP_PUBLIC_URL` | derived from `MCP_HOST`/`MCP_PORT` | The externally-reachable base URL for this server (e.g. `https://mcp.example.com`), used for OAuth issuer/redirect URLs. Required if the server sits behind a reverse proxy or tunnel. |
 
 Point any MCP-over-HTTP client at `http://<host>:<port>/mcp`.
 
+Variables can also be placed in a `.env.local` file in the directory the server is run from - it's loaded automatically on startup (and never overrides variables already set in the environment). Copy [`.env.local.example`](.env.local.example) to `.env.local` and fill in what you need to get started.
+
 > **⚠️ This server executes commands on the host machine.** Anyone who can reach the `/mcp` endpoint can run Windows commands with the privileges of the process. Never bind to `0.0.0.0` or a public interface without `MCP_AUTH_TOKEN` set, and prefer putting it behind a reverse proxy / VPN / firewall rule that restricts access even when a token is configured.
+
+### Connecting OAuth-only clients (e.g. Claude.ai custom connectors)
+
+Some remote MCP clients always perform an OAuth handshake before connecting, rather than letting you supply a bearer token directly. When `MCP_AUTH_TOKEN` is set, this server exposes a minimal OAuth 2.1 authorization server alongside the resource server, so those clients work without any extra configuration:
+
+- Discovery metadata at `/.well-known/oauth-authorization-server` and `/.well-known/oauth-protected-resource/mcp`
+- Open dynamic client registration at `/register` (any client may register - the shared secret is what actually gates access, not the client id)
+- `/authorize` shows a one-field login page asking for the `MCP_AUTH_TOKEN` value; entering it correctly issues an authorization code
+- `/token` exchanges that code (via standard PKCE) for a bearer token accepted by `/mcp`
+
+To use it, add this server as a custom connector using `http://<host>:<port>/mcp` (or your `MCP_PUBLIC_URL` + `/mcp`) as the URL - the client will discover the endpoints above automatically and prompt you for the token in a browser tab. If `MCP_AUTH_TOKEN` is not set, `/authorize` auto-approves with no prompt, which is only appropriate for a server bound to localhost.
+
+Note that OAuth issuer URLs must be `https://` unless the host is `localhost`/`127.0.0.1` - set `MCP_PUBLIC_URL` to your public HTTPS URL when running behind a reverse proxy or tunnel, or the server will log a warning and fall back to plain bearer-token auth only.
 
 ## Security Considerations
 

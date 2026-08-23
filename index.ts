@@ -7,16 +7,33 @@ import { z } from "zod";
 import { execSync, spawn, type ChildProcess } from "child_process";
 import { platform } from "os";
 import { randomUUID, timingSafeEqual } from "crypto";
+import { existsSync } from "fs";
+import { resolve } from "path";
+import { config as loadDotenv } from "dotenv";
 import type { Request, Response, NextFunction } from "express";
+import { installOAuthShim } from "./oauth.js";
+
+// Load a .env.local file from the current working directory, if present. dotenv does not
+// override variables already set in the process environment.
+{
+  const envPath = resolve(process.cwd(), ".env.local");
+  if (existsSync(envPath)) {
+    loadDotenv({ path: envPath });
+    console.error(`Loaded environment variables from ${envPath}`);
+  }
+}
 
 // Detect operating system
 const isWindows = platform() === 'win32';
 
-// Create server instance
-const server = new McpServer({
-  name: "windows-command-line",
-  version: "0.3.0",
-});
+// Creates a fresh McpServer instance with all tools registered. Each transport connection
+// (the single stdio connection, or each HTTP session) needs its own instance, since a Server
+// can only be connected to one transport at a time.
+function createServer(): McpServer {
+  const server = new McpServer({
+    name: "windows-command-line",
+    version: "0.3.0",
+  });
 
 // Persistent working directory, shared across tool calls on this server process -
 // mirrors the "working directory persists between commands" behavior of a shell session.
@@ -788,6 +805,9 @@ server.tool(
   }
 );
 
+  return server;
+}
+
 // Constant-time comparison of a bearer token against the configured secret.
 function isValidToken(provided: string, expected: string): boolean {
   const providedBuf = Buffer.from(provided);
@@ -802,6 +822,7 @@ function isValidToken(provided: string, expected: string): boolean {
 
 // Start the server over stdio (default; used by MCP clients that spawn this as a local subprocess).
 async function startStdio() {
+  const server = createServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("Windows Command Line MCP Server running on stdio");
@@ -824,19 +845,50 @@ async function startHttp() {
 
   const app = createMcpExpressApp({ host });
 
+  const publicUrl = process.env.MCP_PUBLIC_URL || `http://${host === "0.0.0.0" ? "localhost" : host}:${port}`;
+  const resourceServerUrl = new URL("/mcp", publicUrl);
+
+  let oauthBearer: ((req: Request, res: Response, next: NextFunction) => void) | undefined;
+  try {
+    oauthBearer = installOAuthShim({
+      app,
+      issuerUrl: new URL(publicUrl),
+      resourceServerUrl,
+      authToken,
+    });
+    console.error(`OAuth endpoints available under ${publicUrl} (discovery, /register, /authorize, /token).`);
+  } catch (error) {
+    console.error(
+      `OAuth support disabled: ${error}. Set MCP_PUBLIC_URL to an https:// URL (or a localhost URL) to enable it. ` +
+      `Falling back to plain bearer-token auth only.`
+    );
+  }
+  if (!process.env.MCP_PUBLIC_URL && host !== "127.0.0.1" && host !== "localhost" && host !== "::1") {
+    console.error(
+      "Warning: MCP_PUBLIC_URL is not set. OAuth issuer/resource URLs default to this server's bind address, " +
+      "which is wrong if it's reached through a reverse proxy or tunnel - set MCP_PUBLIC_URL to the externally visible https:// URL."
+    );
+  }
+
+  // Accepts either the raw MCP_AUTH_TOKEN as a static bearer token, or a token issued by the
+  // OAuth shim's /token endpoint after a client completed the /authorize login form.
   const requireAuth = (req: Request, res: Response, next: NextFunction) => {
     if (!authToken) return next();
     const header = req.headers.authorization;
     const provided = header?.startsWith("Bearer ") ? header.slice(7) : undefined;
-    if (!provided || !isValidToken(provided, authToken)) {
-      res.status(401).json({
-        jsonrpc: "2.0",
-        error: { code: -32001, message: "Unauthorized" },
-        id: null,
-      });
+    if (provided && isValidToken(provided, authToken)) {
+      next();
       return;
     }
-    next();
+    if (oauthBearer) {
+      oauthBearer(req, res, next);
+      return;
+    }
+    res.status(401).json({
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "Unauthorized" },
+      id: null,
+    });
   };
 
   // Map of active sessions, keyed by MCP session ID.
@@ -861,7 +913,7 @@ async function startHttp() {
             delete transports[sid];
           }
         };
-        await server.connect(transport);
+        await createServer().connect(transport);
         await transport.handleRequest(req, res, req.body);
         return;
       } else {
