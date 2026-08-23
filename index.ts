@@ -1,8 +1,13 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { execSync } from "child_process";
+import { execSync, spawn, type ChildProcess } from "child_process";
 import { platform } from "os";
+import { randomUUID, timingSafeEqual } from "crypto";
+import type { Request, Response, NextFunction } from "express";
 
 // Detect operating system
 const isWindows = platform() === 'win32';
@@ -12,6 +17,88 @@ const server = new McpServer({
   name: "windows-command-line",
   version: "0.3.0",
 });
+
+// Persistent working directory, shared across tool calls on this server process -
+// mirrors the "working directory persists between commands" behavior of a shell session.
+let currentWorkingDirectory = process.cwd();
+
+const MAX_TIMEOUT_MS = 600000; // 10 minutes, matches typical shell-tool ceilings
+const DEFAULT_TIMEOUT_MS = 120000; // 2 minutes
+function clampTimeout(timeout: number): number {
+  return Math.min(Math.max(timeout, 1), MAX_TIMEOUT_MS);
+}
+
+function resolveWorkingDir(workingDir?: string): string {
+  if (workingDir) {
+    currentWorkingDirectory = workingDir;
+  }
+  return currentWorkingDirectory;
+}
+
+// Background process tracking, so long-running commands can be started without
+// blocking the calling tool call and polled for output afterward.
+const MAX_BUFFERED_OUTPUT = 1_000_000; // cap buffered stdout/stderr per stream, in characters
+
+interface BackgroundProcess {
+  id: string;
+  command: string;
+  proc: ChildProcess;
+  stdout: string;
+  stderr: string;
+  status: "running" | "completed" | "failed" | "killed";
+  exitCode: number | null;
+  startedAt: Date;
+  endedAt: Date | null;
+}
+
+const backgroundProcesses = new Map<string, BackgroundProcess>();
+
+function appendCapped(existing: string, chunk: string): string {
+  const combined = existing + chunk;
+  return combined.length > MAX_BUFFERED_OUTPUT
+    ? combined.slice(combined.length - MAX_BUFFERED_OUTPUT)
+    : combined;
+}
+
+// Spawns `file arg0 arg1 ...` detached in the background and tracks it under a new id.
+function spawnBackground(file: string, args: string[], cwd: string, displayCommand: string): string {
+  const id = randomUUID();
+  const proc = spawn(file, args, { cwd, detached: isWindows ? false : true });
+
+  const entry: BackgroundProcess = {
+    id,
+    command: displayCommand,
+    proc,
+    stdout: "",
+    stderr: "",
+    status: "running",
+    exitCode: null,
+    startedAt: new Date(),
+    endedAt: null,
+  };
+  backgroundProcesses.set(id, entry);
+
+  proc.stdout?.on("data", (chunk) => {
+    entry.stdout = appendCapped(entry.stdout, chunk.toString());
+  });
+  proc.stderr?.on("data", (chunk) => {
+    entry.stderr = appendCapped(entry.stderr, chunk.toString());
+  });
+  proc.on("error", (error) => {
+    entry.status = "failed";
+    entry.endedAt = new Date();
+    entry.stderr = appendCapped(entry.stderr, `\n[process error: ${error.message}]`);
+  });
+  proc.on("exit", (code) => {
+    entry.exitCode = code;
+    entry.endedAt = new Date();
+    if (entry.status === "running") {
+      entry.status = code === 0 ? "completed" : "failed";
+    }
+  });
+
+  return id;
+}
 
 // Helper function to handle command execution based on platform
 function executeCommand(command: string, options: any = {}) {
@@ -445,25 +532,28 @@ server.tool(
 // Register the execute_command tool
 server.tool(
   "execute_command",
-  "Execute a Windows command and return its output. Only commands in the allowed list can be executed. This tool should be used for running simple commands like 'dir', 'echo', etc.",
+  "Execute a Windows command and return its output, similar to a shell/bash tool. Only commands not matching the dangerous-pattern blocklist can be executed. " +
+  "The working directory persists across calls (pass workingDir to change it, like 'cd'). " +
+  "For commands that may run longer than the timeout, set runInBackground to true and poll with get_background_output.",
   {
     command: z.string().describe("The command to execute"),
-    workingDir: z.string().optional().describe("Working directory for the command"),
-    timeout: z.number().default(30000).describe("Timeout in milliseconds"),
+    workingDir: z.string().optional().describe("Working directory for the command. If provided, also becomes the persisted working directory for subsequent calls."),
+    timeout: z.number().default(DEFAULT_TIMEOUT_MS).describe(`Timeout in milliseconds (default ${DEFAULT_TIMEOUT_MS}, max ${MAX_TIMEOUT_MS}). Ignored when runInBackground is true.`),
+    runInBackground: z.boolean().default(false).describe("If true, start the command detached and return immediately with a process id. Use get_background_output, list_background_processes, and stop_background_process to manage it."),
   },
-  async ({ command, workingDir, timeout }) => {
+  async ({ command, workingDir, timeout, runInBackground }) => {
     try {
       // Security check: Ensure only allowed commands are executed
       const commandLower = command.toLowerCase();
-      
+
       // Block potentially dangerous commands
       const dangerousPatterns = [
-        'net user', 'net localgroup', 'netsh', 'format', 'rd /s', 'rmdir /s', 
+        'net user', 'net localgroup', 'netsh', 'format', 'rd /s', 'rmdir /s',
         'del /f', 'reg delete', 'shutdown', 'taskkill', 'sc delete', 'bcdedit',
         'cacls', 'icacls', 'takeown', 'diskpart', 'cipher /w', 'schtasks /create',
         'rm -rf', 'sudo', 'chmod', 'chown', 'passwd', 'mkfs', 'dd'
       ];
-      
+
       // Check for dangerous patterns
       if (dangerousPatterns.some(pattern => commandLower.includes(pattern.toLowerCase()))) {
         return {
@@ -476,12 +566,25 @@ server.tool(
           ],
         };
       }
-      
-      const options: any = { timeout };
-      if (workingDir) {
-        options.cwd = workingDir;
+
+      const cwd = resolveWorkingDir(workingDir);
+
+      if (runInBackground) {
+        const id = isWindows
+          ? spawnBackground("cmd.exe", ["/c", command], cwd, command)
+          : spawnBackground("/bin/sh", ["-c", command], cwd, command);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Started in background with id ${id}. Use get_background_output with this id to fetch output.`,
+            },
+          ],
+        };
       }
-      
+
+      const options: any = { timeout: clampTimeout(timeout), cwd };
+
       let cmdToExecute;
       if (isWindows) {
         cmdToExecute = `cmd.exe /c ${command}`;
@@ -489,7 +592,7 @@ server.tool(
         // For non-Windows, try to execute the command directly
         cmdToExecute = command;
       }
-      
+
       const stdout = executeCommand(cmdToExecute, options);
       return {
         content: [
@@ -516,13 +619,16 @@ server.tool(
 // Register the execute_powershell tool
 server.tool(
   "execute_powershell",
-  "Execute a PowerShell script and return its output. This allows for more complex operations and script execution. PowerShell must be in the allowed commands list.",
+  "Execute a PowerShell script and return its output. This allows for more complex operations and script execution. " +
+  "The working directory persists across calls (pass workingDir to change it, like 'cd'). " +
+  "For scripts that may run longer than the timeout, set runInBackground to true and poll with get_background_output.",
   {
     script: z.string().describe("PowerShell script to execute"),
-    workingDir: z.string().optional().describe("Working directory for the script"),
-    timeout: z.number().default(30000).describe("Timeout in milliseconds"),
+    workingDir: z.string().optional().describe("Working directory for the script. If provided, also becomes the persisted working directory for subsequent calls."),
+    timeout: z.number().default(DEFAULT_TIMEOUT_MS).describe(`Timeout in milliseconds (default ${DEFAULT_TIMEOUT_MS}, max ${MAX_TIMEOUT_MS}). Ignored when runInBackground is true.`),
+    runInBackground: z.boolean().default(false).describe("If true, start the script detached and return immediately with a process id. Use get_background_output, list_background_processes, and stop_background_process to manage it."),
   },
-  async ({ script, workingDir, timeout }) => {
+  async ({ script, workingDir, timeout, runInBackground }) => {
     if (!isWindows) {
       return {
         content: [
@@ -533,21 +639,21 @@ server.tool(
         ],
       };
     }
-    
+
     try {
       // Security check: Ensure no dangerous operations
       const scriptLower = script.toLowerCase();
-      
+
       // Block potentially dangerous commands
       const dangerousPatterns = [
-        'new-user', 'add-user', 'remove-item -recurse -force', 'format-volume', 
+        'new-user', 'add-user', 'remove-item -recurse -force', 'format-volume',
         'reset-computer', 'stop-computer', 'restart-computer', 'stop-process -force',
         'remove-item -force', 'set-executionpolicy', 'invoke-webrequest',
         'start-bitstransfer', 'set-location', 'invoke-expression', 'iex', '& {',
         'invoke-command', 'new-psdrive', 'remove-psdrive', 'enable-psremoting',
         'new-service', 'remove-service', 'set-service'
       ];
-      
+
       // Check for dangerous patterns
       if (dangerousPatterns.some(pattern => scriptLower.includes(pattern.toLowerCase()))) {
         return {
@@ -560,12 +666,23 @@ server.tool(
           ],
         };
       }
-      
-      const options: any = { timeout };
-      if (workingDir) {
-        options.cwd = workingDir;
+
+      const cwd = resolveWorkingDir(workingDir);
+
+      if (runInBackground) {
+        const id = spawnBackground("powershell.exe", ["-Command", script], cwd, script);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Started in background with id ${id}. Use get_background_output with this id to fetch output.`,
+            },
+          ],
+        };
       }
-      
+
+      const options: any = { timeout: clampTimeout(timeout), cwd };
+
       const stdout = executeCommand(`powershell.exe -Command "${script}"`, options);
       return {
         content: [
@@ -589,18 +706,228 @@ server.tool(
   }
 );
 
+// Register background-process management tools (mirrors run_in_background + monitor/stop tooling
+// found in interactive shell tools).
+server.tool(
+  "get_background_output",
+  "Fetch the buffered stdout/stderr and status of a command started with runInBackground. Output accumulates until the process exits.",
+  {
+    id: z.string().describe("The background process id returned when it was started"),
+  },
+  async ({ id }) => {
+    const entry = backgroundProcesses.get(id);
+    if (!entry) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `No background process found with id ${id}` }],
+      };
+    }
+    const summary =
+      `id: ${entry.id}\n` +
+      `command: ${entry.command}\n` +
+      `status: ${entry.status}\n` +
+      `exitCode: ${entry.exitCode ?? "(still running)"}\n` +
+      `startedAt: ${entry.startedAt.toISOString()}\n` +
+      `endedAt: ${entry.endedAt ? entry.endedAt.toISOString() : "(still running)"}\n\n` +
+      `--- stdout ---\n${entry.stdout || "(empty)"}\n\n` +
+      `--- stderr ---\n${entry.stderr || "(empty)"}`;
+    return { content: [{ type: "text", text: summary }] };
+  }
+);
+
+server.tool(
+  "list_background_processes",
+  "List all background processes started via runInBackground, with their status.",
+  {},
+  async () => {
+    if (backgroundProcesses.size === 0) {
+      return { content: [{ type: "text", text: "No background processes." }] };
+    }
+    const lines = Array.from(backgroundProcesses.values()).map(
+      (entry) =>
+        `${entry.id}  [${entry.status}]  started ${entry.startedAt.toISOString()}  ${entry.command}`
+    );
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+server.tool(
+  "stop_background_process",
+  "Terminate a running background process started via runInBackground.",
+  {
+    id: z.string().describe("The background process id to terminate"),
+  },
+  async ({ id }) => {
+    const entry = backgroundProcesses.get(id);
+    if (!entry) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `No background process found with id ${id}` }],
+      };
+    }
+    if (entry.status !== "running") {
+      return {
+        content: [{ type: "text", text: `Process ${id} is already ${entry.status}.` }],
+      };
+    }
+    try {
+      if (isWindows && entry.proc.pid) {
+        execSync(`taskkill /PID ${entry.proc.pid} /T /F`);
+      } else {
+        entry.proc.kill("SIGTERM");
+      }
+      entry.status = "killed";
+      entry.endedAt = new Date();
+      return { content: [{ type: "text", text: `Process ${id} terminated.` }] };
+    } catch (error) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Error terminating process ${id}: ${error}` }],
+      };
+    }
+  }
+);
+
+// Constant-time comparison of a bearer token against the configured secret.
+function isValidToken(provided: string, expected: string): boolean {
+  const providedBuf = Buffer.from(provided);
+  const expectedBuf = Buffer.from(expected);
+  if (providedBuf.length !== expectedBuf.length) {
+    // Still run a comparison so response time doesn't leak length info.
+    timingSafeEqual(expectedBuf, expectedBuf);
+    return false;
+  }
+  return timingSafeEqual(providedBuf, expectedBuf);
+}
+
+// Start the server over stdio (default; used by MCP clients that spawn this as a local subprocess).
+async function startStdio() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("Windows Command Line MCP Server running on stdio");
+}
+
+// Start the server as a standalone HTTP service using the MCP Streamable HTTP transport,
+// so it can be reached the same way as any other remote MCP server (POST/GET/DELETE /mcp).
+async function startHttp() {
+  const host = process.env.MCP_HOST || "127.0.0.1";
+  const port = process.env.MCP_PORT ? parseInt(process.env.MCP_PORT, 10) : 3000;
+  const authToken = process.env.MCP_AUTH_TOKEN;
+
+  if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1" && !authToken) {
+    console.error(
+      `Warning: Binding to ${host} without MCP_AUTH_TOKEN set. This server can execute arbitrary ` +
+      `commands - anyone who can reach this address and port will be able to run commands on this machine. ` +
+      `Set MCP_AUTH_TOKEN or bind to localhost only.`
+    );
+  }
+
+  const app = createMcpExpressApp({ host });
+
+  const requireAuth = (req: Request, res: Response, next: NextFunction) => {
+    if (!authToken) return next();
+    const header = req.headers.authorization;
+    const provided = header?.startsWith("Bearer ") ? header.slice(7) : undefined;
+    if (!provided || !isValidToken(provided, authToken)) {
+      res.status(401).json({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Unauthorized" },
+        id: null,
+      });
+      return;
+    }
+    next();
+  };
+
+  // Map of active sessions, keyed by MCP session ID.
+  const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+  app.post("/mcp", requireAuth, async (req: Request, res: Response) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    try {
+      let transport: StreamableHTTPServerTransport;
+      if (sessionId && transports[sessionId]) {
+        transport = transports[sessionId];
+      } else if (!sessionId && isInitializeRequest(req.body)) {
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid) => {
+            transports[sid] = transport;
+          },
+        });
+        transport.onclose = () => {
+          const sid = transport.sessionId;
+          if (sid && transports[sid]) {
+            delete transports[sid];
+          }
+        };
+        await server.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+        return;
+      } else {
+        res.status(400).json({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Bad Request: No valid session ID provided" },
+          id: null,
+        });
+        return;
+      }
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error("Error handling MCP request:", error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal server error" },
+          id: null,
+        });
+      }
+    }
+  });
+
+  const handleSessionRequest = async (req: Request, res: Response) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).send("Invalid or missing session ID");
+      return;
+    }
+    await transports[sessionId].handleRequest(req, res);
+  };
+
+  app.get("/mcp", requireAuth, handleSessionRequest);
+  app.delete("/mcp", requireAuth, handleSessionRequest);
+
+  app.listen(port, host, () => {
+    console.error(`Windows Command Line MCP Server listening on http://${host}:${port}/mcp`);
+    if (!authToken) {
+      console.error("Warning: MCP_AUTH_TOKEN is not set - the /mcp endpoint has no authentication.");
+    }
+  });
+
+  process.on("SIGINT", async () => {
+    for (const sessionId of Object.keys(transports)) {
+      await transports[sessionId].close().catch(() => {});
+      delete transports[sessionId];
+    }
+    process.exit(0);
+  });
+}
+
 // Start the server
 async function main() {
   // Log platform information on startup
   console.error(`Starting Windows Command Line MCP Server on platform: ${platform()}`);
-  
+
   if (!isWindows) {
     console.error("Warning: This server is designed for Windows environments. Some features may not work on " + platform());
   }
-  
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("Windows Command Line MCP Server running on stdio");
+
+  const transportMode = (process.env.MCP_TRANSPORT || "stdio").toLowerCase();
+  if (transportMode === "http") {
+    await startHttp();
+  } else {
+    await startStdio();
+  }
 }
 
 main().catch((error) => {
