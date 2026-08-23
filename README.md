@@ -67,15 +67,17 @@ Create new projects safely with the built-in project creation tool:
 - Projects created in a sandboxed `~/AIProjects` directory
 
 ### Available Tools
-1. **execute_command**: Run Windows CLI commands
-2. **execute_powershell**: Execute PowerShell scripts
-3. **create_project**: Safely create new development projects
-4. **list_running_processes**: Retrieve active system processes
-5. **get_system_info**: Collect system configuration details
-6. **get_network_info**: Retrieve network adapter information
-7. **get_scheduled_tasks**: List and query system tasks
-8. **get_service_info**: Manage and query Windows services
-9. **list_allowed_commands**: List all commands that can be executed by the server
+1. **execute_command**: Run Windows CLI commands (supports a persistent working directory and optional background execution)
+2. **execute_powershell**: Execute PowerShell scripts (supports a persistent working directory and optional background execution)
+3. **get_background_output**: Fetch stdout/stderr and status for a command started with `runInBackground`
+4. **list_background_processes**: List all background processes and their status
+5. **stop_background_process**: Terminate a running background process
+6. **list_running_processes**: Retrieve active system processes
+7. **get_system_info**: Collect system configuration details
+8. **get_network_info**: Retrieve network adapter information
+9. **get_scheduled_tasks**: List and query system tasks
+10. **get_service_info**: Manage and query Windows services
+11. **list_allowed_commands**: List all commands that can be executed by the server
 
 ## Using with Claude for Desktop
 
@@ -99,6 +101,32 @@ Replace `/path/to/dist/index.js` with the absolute path to the built `index.js` 
 
 3. Restart Claude for Desktop
 4. You can now use the tools by asking Claude to perform Windows system operations
+
+## Running as an HTTP MCP Server
+
+By default the server communicates over stdio, for clients (like Claude Desktop) that spawn it as a local subprocess. It can also run as a standalone HTTP service exposing the standard MCP Streamable HTTP transport at `/mcp` (`POST`/`GET`/`DELETE`), the same way you'd reach any remote MCP server.
+
+```bash
+# Windows (cmd/PowerShell)
+set MCP_TRANSPORT=http
+node dist/index.js
+
+# or, cross-platform via the npm script
+npm run start:http
+```
+
+Environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MCP_TRANSPORT` | `stdio` | Set to `http` to run the Streamable HTTP server instead of stdio. |
+| `MCP_HOST` | `127.0.0.1` | Interface to bind. Binding beyond localhost is only safe with `MCP_AUTH_TOKEN` set. |
+| `MCP_PORT` | `3000` | Port to listen on. |
+| `MCP_AUTH_TOKEN` | *(none)* | If set, all `/mcp` requests must include `Authorization: Bearer <token>`. |
+
+Point any MCP-over-HTTP client at `http://<host>:<port>/mcp`.
+
+> **⚠️ This server executes commands on the host machine.** Anyone who can reach the `/mcp` endpoint can run Windows commands with the privileges of the process. Never bind to `0.0.0.0` or a public interface without `MCP_AUTH_TOKEN` set, and prefer putting it behind a reverse proxy / VPN / firewall rule that restricts access even when a token is configured.
 
 ## Security Considerations
 

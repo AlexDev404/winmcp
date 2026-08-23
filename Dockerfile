@@ -23,4 +23,8 @@ ENV NODE_ENV=production
 
 RUN npm ci --ignore-scripts --omit-dev
 
+# Runs over stdio by default. Set MCP_TRANSPORT=http (and expose the port below) to run
+# as a standalone HTTP MCP server instead - see README.md for details.
+EXPOSE 3000
+
 ENTRYPOINT ["node", "/app/dist/index.js"]
