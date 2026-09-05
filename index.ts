@@ -6,7 +6,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { execSync, spawn, type ChildProcess } from "child_process";
 import { platform } from "os";
-import { randomUUID, timingSafeEqual } from "crypto";
+import { randomUUID, randomInt, timingSafeEqual } from "crypto";
 import { existsSync, readFileSync, statSync } from "fs";
 import { resolve, extname } from "path";
 import { pathToFileURL } from "url";
@@ -26,6 +26,54 @@ import { installOAuthShim } from "./oauth.js";
 
 // Detect operating system
 const isWindows = platform() === 'win32';
+
+const DANGEROUS_CMD_PATTERNS = [
+  'net user', 'net localgroup', 'netsh', 'format', 'rd /s', 'rmdir /s',
+  'del /f', 'reg delete', 'shutdown', 'taskkill', 'sc delete', 'bcdedit',
+  'cacls', 'icacls', 'takeown', 'diskpart', 'cipher /w', 'schtasks /create',
+  'rm -rf', 'sudo', 'chmod', 'chown', 'passwd', 'mkfs', 'dd'
+];
+
+const DANGEROUS_PS_PATTERNS = [
+  'new-user', 'add-user', 'remove-item -recurse -force', 'format-volume',
+  'reset-computer', 'stop-computer', 'restart-computer', 'stop-process -force',
+  'remove-item -force', 'set-executionpolicy', 'invoke-webrequest',
+  'start-bitstransfer', 'set-location', 'invoke-expression', 'iex', '& {',
+  'invoke-command', 'new-psdrive', 'remove-psdrive', 'enable-psremoting',
+  'new-service', 'remove-service', 'set-service'
+];
+
+// Human-in-the-loop bypass for the dangerous-command blocklist. request_dangerous_override_code
+// prints a one-time code to this server's own console (stderr) - never to the MCP response, so
+// it can only reach whoever has console/log access to the machine this server runs on. The AI
+// must ask that person for the code and pass it to unlock_dangerous_commands before a single
+// blocklist-matching command is allowed through.
+const UNSAFE_CODE_TTL_MS = 5 * 60 * 1000; // time allowed to enter the code after it's generated
+const UNSAFE_UNLOCK_TTL_MS = 2 * 60 * 1000; // time the unlock stays valid if never used
+
+const MAX_UNSAFE_CODE_ATTEMPTS = 5;
+
+interface UnsafeModeState {
+  pendingCode: string | null;
+  pendingCodeExpiresAt: number | null;
+  failedAttempts: number;
+  unlockedUntil: number | null;
+}
+const unsafeMode: UnsafeModeState = { pendingCode: null, pendingCodeExpiresAt: null, failedAttempts: 0, unlockedUntil: null };
+
+function isUnsafeModeUnlocked(): boolean {
+  if (!unsafeMode.unlockedUntil) return false;
+  if (Date.now() > unsafeMode.unlockedUntil) {
+    unsafeMode.unlockedUntil = null;
+    return false;
+  }
+  return true;
+}
+
+// Consumes the unlock, so it only ever covers a single dangerous command.
+function consumeUnsafeModeUnlock(): void {
+  unsafeMode.unlockedUntil = null;
+}
 
 // Creates a fresh McpServer instance with all tools registered. Each transport connection
 // (the single stdio connection, or each HTTP session) needs its own instance, since a Server
@@ -582,7 +630,8 @@ server.tool(
 // Register the execute_command tool
 server.tool(
   "execute_command",
-  "Execute a Windows command and return its output, similar to a shell/bash tool. Only commands not matching the dangerous-pattern blocklist can be executed. " +
+  "Execute a Windows command and return its output, similar to a shell/bash tool. Only commands not matching the dangerous-pattern blocklist can be executed, " +
+  "unless the dangerous-command override is currently unlocked (see request_dangerous_override_code). " +
   "The working directory persists across calls (pass workingDir to change it, like 'cd'). " +
   "For commands that may run longer than the timeout, set runInBackground to true and poll with get_background_output.",
   {
@@ -596,25 +645,22 @@ server.tool(
       // Security check: Ensure only allowed commands are executed
       const commandLower = command.toLowerCase();
 
-      // Block potentially dangerous commands
-      const dangerousPatterns = [
-        'net user', 'net localgroup', 'netsh', 'format', 'rd /s', 'rmdir /s',
-        'del /f', 'reg delete', 'shutdown', 'taskkill', 'sc delete', 'bcdedit',
-        'cacls', 'icacls', 'takeown', 'diskpart', 'cipher /w', 'schtasks /create',
-        'rm -rf', 'sudo', 'chmod', 'chown', 'passwd', 'mkfs', 'dd'
-      ];
-
-      // Check for dangerous patterns
-      if (dangerousPatterns.some(pattern => commandLower.includes(pattern.toLowerCase()))) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: "Command contains potentially dangerous operations and cannot be executed.",
-            },
-          ],
-        };
+      // Block potentially dangerous commands, unless a human has unlocked the override.
+      if (DANGEROUS_CMD_PATTERNS.some(pattern => commandLower.includes(pattern.toLowerCase()))) {
+        if (!isUnsafeModeUnlocked()) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: "Command contains potentially dangerous operations and cannot be executed. " +
+                      "Call request_dangerous_override_code and ask the server operator for the code to bypass this for one command.",
+              },
+            ],
+          };
+        }
+        consumeUnsafeModeUnlock();
+        console.error(`[unsafe-mode] Executing dangerous-pattern command via override: ${command}`);
       }
 
       const cwd = resolveWorkingDir(workingDir);
@@ -669,7 +715,8 @@ server.tool(
 // Register the execute_powershell tool
 server.tool(
   "execute_powershell",
-  "Execute a PowerShell script and return its output. This allows for more complex operations and script execution. " +
+  "Execute a PowerShell script and return its output. This allows for more complex operations and script execution. Only scripts not matching the " +
+  "dangerous-pattern blocklist can be executed, unless the dangerous-command override is currently unlocked (see request_dangerous_override_code). " +
   "The working directory persists across calls (pass workingDir to change it, like 'cd'). " +
   "For scripts that may run longer than the timeout, set runInBackground to true and poll with get_background_output.",
   {
@@ -694,27 +741,22 @@ server.tool(
       // Security check: Ensure no dangerous operations
       const scriptLower = script.toLowerCase();
 
-      // Block potentially dangerous commands
-      const dangerousPatterns = [
-        'new-user', 'add-user', 'remove-item -recurse -force', 'format-volume',
-        'reset-computer', 'stop-computer', 'restart-computer', 'stop-process -force',
-        'remove-item -force', 'set-executionpolicy', 'invoke-webrequest',
-        'start-bitstransfer', 'set-location', 'invoke-expression', 'iex', '& {',
-        'invoke-command', 'new-psdrive', 'remove-psdrive', 'enable-psremoting',
-        'new-service', 'remove-service', 'set-service'
-      ];
-
-      // Check for dangerous patterns
-      if (dangerousPatterns.some(pattern => scriptLower.includes(pattern.toLowerCase()))) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: "Script contains potentially dangerous operations and cannot be executed.",
-            },
-          ],
-        };
+      // Block potentially dangerous commands, unless a human has unlocked the override.
+      if (DANGEROUS_PS_PATTERNS.some(pattern => scriptLower.includes(pattern.toLowerCase()))) {
+        if (!isUnsafeModeUnlocked()) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: "Script contains potentially dangerous operations and cannot be executed. " +
+                      "Call request_dangerous_override_code and ask the server operator for the code to bypass this for one command.",
+              },
+            ],
+          };
+        }
+        consumeUnsafeModeUnlock();
+        console.error(`[unsafe-mode] Executing dangerous-pattern PowerShell script via override: ${script}`);
       }
 
       const cwd = resolveWorkingDir(workingDir);
@@ -753,6 +795,97 @@ server.tool(
         ],
       };
     }
+  }
+);
+
+// Register the dangerous-command override tools. These exist to let a human who has console/log
+// access to this machine deliberately authorize one otherwise-blocked command, without ever
+// putting the unlock code in front of the AI/MCP client itself.
+server.tool(
+  "request_dangerous_override_code",
+  "Request a one-time code to bypass the dangerous-command blocklist for a single execute_command or execute_powershell call. " +
+  "The code is printed to this server's own console/log output, NOT returned here - you must ask the person operating this " +
+  "server for it, then call unlock_dangerous_commands with the code they give you.",
+  {},
+  async () => {
+    const code = String(randomInt(100000, 1000000));
+    unsafeMode.pendingCode = code;
+    unsafeMode.pendingCodeExpiresAt = Date.now() + UNSAFE_CODE_TTL_MS;
+    unsafeMode.failedAttempts = 0;
+
+    console.error(
+      "\n" +
+      "================================================================\n" +
+      " DANGEROUS COMMAND OVERRIDE REQUESTED\n" +
+      ` Confirmation code: ${code}\n` +
+      ` Expires in ${Math.round(UNSAFE_CODE_TTL_MS / 60000)} minute(s).\n` +
+      " Only share this code if you intend to let the AI run ONE command\n" +
+      " that this server would otherwise block as dangerous.\n" +
+      "================================================================\n"
+    );
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: "A confirmation code was generated and printed to this server's console/log output. " +
+                "Ask the person operating this server to read it to you, then call unlock_dangerous_commands with that code. " +
+                `It expires in ${Math.round(UNSAFE_CODE_TTL_MS / 60000)} minute(s).`,
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "unlock_dangerous_commands",
+  "Redeem the code from request_dangerous_override_code to bypass the dangerous-command blocklist for the next single " +
+  "execute_command or execute_powershell call that would otherwise be blocked.",
+  {
+    code: z.string().describe("The confirmation code shown on the server's console by request_dangerous_override_code"),
+  },
+  async ({ code }) => {
+    if (!unsafeMode.pendingCode || !unsafeMode.pendingCodeExpiresAt || Date.now() > unsafeMode.pendingCodeExpiresAt) {
+      unsafeMode.pendingCode = null;
+      unsafeMode.pendingCodeExpiresAt = null;
+      return {
+        isError: true,
+        content: [{ type: "text", text: "No pending code (or it expired). Call request_dangerous_override_code to get a new one." }],
+      };
+    }
+
+    if (code.trim() !== unsafeMode.pendingCode) {
+      unsafeMode.failedAttempts += 1;
+      if (unsafeMode.failedAttempts >= MAX_UNSAFE_CODE_ATTEMPTS) {
+        unsafeMode.pendingCode = null;
+        unsafeMode.pendingCodeExpiresAt = null;
+        unsafeMode.failedAttempts = 0;
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Incorrect code, too many attempts. Call request_dangerous_override_code to get a new one." }],
+        };
+      }
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Incorrect code (${MAX_UNSAFE_CODE_ATTEMPTS - unsafeMode.failedAttempts} attempt(s) remaining before it is invalidated).` }],
+      };
+    }
+
+    unsafeMode.pendingCode = null;
+    unsafeMode.pendingCodeExpiresAt = null;
+    unsafeMode.failedAttempts = 0;
+    unsafeMode.unlockedUntil = Date.now() + UNSAFE_UNLOCK_TTL_MS;
+    console.error("[unsafe-mode] Dangerous-command override unlocked for the next matching command.");
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Unlocked. The next execute_command or execute_powershell call that matches the dangerous-pattern blocklist will be allowed " +
+                `through (expires in ${Math.round(UNSAFE_UNLOCK_TTL_MS / 60000)} minute(s) if unused).`,
+        },
+      ],
+    };
   }
 );
 

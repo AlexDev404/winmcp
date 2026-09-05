@@ -79,8 +79,21 @@ Create new projects safely with the built-in project creation tool:
 10. **get_scheduled_tasks**: List and query system tasks
 11. **get_service_info**: Manage and query Windows services
 12. **list_allowed_commands**: List all commands that can be executed by the server
+13. **request_dangerous_override_code**: Request a one-time code (printed to the server's own console, not returned to the AI) to bypass the dangerous-command blocklist for one command
+14. **unlock_dangerous_commands**: Redeem that code to allow the next blocklist-matching `execute_command`/`execute_powershell` call through
 
 `download_file` is capped at 10 MB by default (base64 encoding inflates binary files by ~33% in the response) - set `MCP_MAX_DOWNLOAD_BYTES` to a different byte count to change the limit.
+
+### Bypassing the dangerous-command blocklist
+
+`execute_command` and `execute_powershell` refuse anything matching a blocklist of destructive patterns (disk formatting, user management, `rm -rf`, etc. - see [Security Considerations](#security-considerations)). Sometimes you genuinely need to run one of those commands. Rather than removing the blocklist, there's a human-in-the-loop override:
+
+1. The AI calls `request_dangerous_override_code`. The server generates a random 6-digit code and prints it **only to its own console/log output** - it is never included in the tool's response, so the AI cannot see it on its own.
+2. The AI asks you (the person who can see that console) for the code.
+3. The AI calls `unlock_dangerous_commands` with the code you give it.
+4. If correct, the very next `execute_command`/`execute_powershell` call that matches the blocklist is allowed through; the unlock is then consumed. It also expires after 2 minutes if never used, and the code itself expires after 5 minutes if never redeemed (5 wrong guesses invalidates it early).
+
+This means a blocked command can only ever be approved by someone with direct access to the machine's console/logs - not by the AI or a remote MCP client alone.
 
 ## Using with Claude for Desktop
 
